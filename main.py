@@ -87,6 +87,7 @@ def main() -> None:
     holdout_failures:           dict[str, int]      = {}
     quarantine_until:           dict[str, datetime] = {}
     total_trials_per_symbol:    dict[str, int]      = {}
+    evaluated_hashes:           set[str]            = set()
     search_cycle = 0
     symbol_idx   = 0
 
@@ -159,9 +160,10 @@ def main() -> None:
 
         for params in stable:
             p_hash = params_hash(params)
-            if p_hash in existing_hashes:
+            if p_hash in existing_hashes or p_hash in evaluated_hashes:
                 logger.debug(f"[{symbol}] Duplicate params — skipping")
                 continue
+            evaluated_hashes.add(p_hash)
 
             # ── WFO: rolling + anchored + holdout ────────────────────────────
             try:

@@ -72,10 +72,12 @@ class NumpyOHLCV:
     volume:     np.ndarray
     timestamps: np.ndarray          # int64, UTC nanoseconds
 
-    atr_arrays:   Optional[dict] = field(default=None)  # dict[int, np.ndarray]
-    adx_arrays:   Optional[dict] = field(default=None)  # dict[int, np.ndarray]
-    hurst_arrays: Optional[dict] = field(default=None)  # dict[int, np.ndarray]
-    bb_pct:       Optional[np.ndarray] = field(default=None)
+    atr_arrays:    Optional[dict] = field(default=None)  # dict[int, np.ndarray]
+    adx_arrays:    Optional[dict] = field(default=None)  # dict[int, np.ndarray]
+    di_plus_arrays:  Optional[dict] = field(default=None)  # dict[int, np.ndarray]
+    di_minus_arrays: Optional[dict] = field(default=None)  # dict[int, np.ndarray]
+    hurst_arrays:  Optional[dict] = field(default=None)  # dict[int, np.ndarray]
+    bb_pct:        Optional[np.ndarray] = field(default=None)
 
 
 # ── Array preparation ──────────────────────────────────────────────────────────
@@ -119,10 +121,14 @@ def prepare_4h_arrays(df_4h: pd.DataFrame) -> NumpyOHLCV:
         arr = compute_atr(df_4h, p)
         atr_arrays[p] = np.ascontiguousarray(arr.values, dtype=np.float64)
 
-    adx_arrays: dict[int, np.ndarray] = {}
+    adx_arrays:      dict[int, np.ndarray] = {}
+    di_plus_arrays:  dict[int, np.ndarray] = {}
+    di_minus_arrays: dict[int, np.ndarray] = {}
     for p in range(adx_lo, adx_hi + 1):
-        arr = compute_adx(df_4h, p)["ADX"]
-        adx_arrays[p] = np.ascontiguousarray(arr.values, dtype=np.float64)
+        adx_result = compute_adx(df_4h, p)
+        adx_arrays[p]      = np.ascontiguousarray(adx_result["ADX"].values,     dtype=np.float64)
+        di_plus_arrays[p]  = np.ascontiguousarray(adx_result["DI_plus"].values,  dtype=np.float64)
+        di_minus_arrays[p] = np.ascontiguousarray(adx_result["DI_minus"].values, dtype=np.float64)
 
     hurst_arrays: dict[int, np.ndarray] = {}
     for w in range(hst_lo, hst_hi + 1):
@@ -135,13 +141,14 @@ def prepare_4h_arrays(df_4h: pd.DataFrame) -> NumpyOHLCV:
 
     logger.info(
         f"prepare_4h_arrays: done — "
-        f"{len(atr_arrays)} ATR, {len(adx_arrays)} ADX, "
+        f"{len(atr_arrays)} ATR, {len(adx_arrays)} ADX (+ DI+/DI-), "
         f"{len(hurst_arrays)} Hurst arrays cached"
     )
     return NumpyOHLCV(
         open=base.open, high=base.high, low=base.low,
         close=base.close, volume=base.volume, timestamps=base.timestamps,
         atr_arrays=atr_arrays, adx_arrays=adx_arrays,
+        di_plus_arrays=di_plus_arrays, di_minus_arrays=di_minus_arrays,
         hurst_arrays=hurst_arrays, bb_pct=bb_pct_arr,
     )
 
@@ -190,7 +197,7 @@ def _run_trial(
         data  = DataPair(df_4h=df_4h, df_1m=df_1m, funding=funding)
 
         bt     = Backtester()
-        result = bt.run(params, data, initial_capital=10_000.0, ref_atr=ref_atr)
+        result = bt.run(params, data, initial_capital=10_000.0, ref_atr=ref_atr, np_4h=np_4h)
         return compute_metrics(result.equity_curve, result.trades, result.killed_early)
     except Exception as exc:
         logger.debug(f"Trial backtest error ({type(exc).__name__}): {exc}")

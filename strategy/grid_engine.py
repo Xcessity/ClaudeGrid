@@ -405,6 +405,7 @@ class GridEngine:
         params: GridParams,
         initial_capital: float,
         ref_atr: float,
+        np_4h=None,
     ) -> SimResult:
         """
         df_4h:         4h OHLCV (indicator computation, regime, grid placement)
@@ -412,12 +413,26 @@ class GridEngine:
         funding_rates: 8h funding rate Series (UTC index, values = rate as fraction)
         ref_atr:       median ATR of full optimization period (stable sizing reference)
         """
-        # ── Pre-compute all 4h indicators vectorized ───────────────────────────
-        atr_4h      = compute_atr(df_4h, params.atr_period)
-        adx_4h      = compute_adx(df_4h, params.adx_period)
-        hurst_4h    = compute_hurst_dfa(df_4h["close"], params.hurst_window)
-        bb_width_4h = compute_bb_width(df_4h, period=config.bb_period)
-        bb_pct_4h   = compute_bb_width_percentile(bb_width_4h)
+        # ── Pre-compute all 4h indicators ─────────────────────────────────────
+        if np_4h is not None and np_4h.atr_arrays is not None:
+            atr_vals      = np_4h.atr_arrays[params.atr_period]
+            adx_vals      = np_4h.adx_arrays[params.adx_period]
+            di_plus_vals  = np_4h.di_plus_arrays[params.adx_period]
+            di_minus_vals = np_4h.di_minus_arrays[params.adx_period]
+            hurst_vals    = np_4h.hurst_arrays[params.hurst_window]
+            bb_pct_vals   = np_4h.bb_pct
+        else:
+            atr_4h      = compute_atr(df_4h, params.atr_period)
+            adx_4h      = compute_adx(df_4h, params.adx_period)
+            hurst_4h    = compute_hurst_dfa(df_4h["close"], params.hurst_window)
+            bb_width_4h = compute_bb_width(df_4h, period=config.bb_period)
+            bb_pct_4h   = compute_bb_width_percentile(bb_width_4h)
+            atr_vals      = atr_4h.values
+            adx_vals      = adx_4h["ADX"].values
+            di_plus_vals  = adx_4h["DI_plus"].values
+            di_minus_vals = adx_4h["DI_minus"].values
+            hurst_vals    = hurst_4h.values
+            bb_pct_vals   = bb_pct_4h.values
 
         warmup_bars = max(
             params.atr_period, params.adx_period,
@@ -459,10 +474,10 @@ class GridEngine:
                 continue
 
             # 1. Read 4h indicators for this bar
-            h           = self._safe(hurst_4h.iloc[i],          0.5)
-            adx_val     = self._safe(adx_4h["ADX"].iloc[i],     0.0)
-            current_atr = max(self._safe(atr_4h.iloc[i], ref_atr), 1e-8)
-            bb_pct      = self._safe(bb_pct_4h.iloc[i],         0.5)
+            h           = self._safe(hurst_vals[i],   0.5)
+            adx_val     = self._safe(adx_vals[i],     0.0)
+            current_atr = max(self._safe(atr_vals[i], ref_atr), 1e-8)
+            bb_pct      = self._safe(bb_pct_vals[i],  0.5)
 
             regime_trending = (h > params.hurst_threshold or adx_val > params.adx_threshold)
 
@@ -477,8 +492,7 @@ class GridEngine:
                 extreme_price = float(bar_4h.close)
                 breakout_dir  = (
                     "up"
-                    if self._safe(adx_4h["DI_plus"].iloc[i], 0.0)
-                       >= self._safe(adx_4h["DI_minus"].iloc[i], 0.0)
+                    if self._safe(di_plus_vals[i], 0.0) >= self._safe(di_minus_vals[i], 0.0)
                     else "down"
                 )
                 grid_levels   = None

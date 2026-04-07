@@ -71,6 +71,7 @@ class Backtester:
         data: DataPair,
         initial_capital: float = 10_000.0,
         ref_atr: float = None,
+        np_4h=None,
     ) -> BacktestResult:
         """
         params:          grid strategy parameters
@@ -94,6 +95,7 @@ class Backtester:
             params=params,
             initial_capital=initial_capital,
             ref_atr=ref_atr,
+            np_4h=np_4h,
         )
 
         return BacktestResult(
