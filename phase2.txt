@@ -1,0 +1,14 @@
+Phase 2 of our build: Refer to ARCHITECTURE.md. We are now building the simulation engine. 
+
+Please create the following files:
+1. `strategy/indicators.py`
+2. `strategy/grid_engine.py`
+3. `backtester/engine.py`
+4. `backtester/metrics.py`
+
+CRITICAL: 
+- Ensure `grid_engine.py` uses the `max(current_atr, 1e-8)` floor to prevent division by zero.
+- Ensure the dynamic slippage logic and Maker/Taker fee separations are accurately implemented.
+- Ensure `indicators.py` relies on `pandas-ta` but `grid_engine.py` is prepared to receive the pre-computed arrays.
+
+Once written, create a temporary test script that loads the cached data from Phase 1, runs a single backtest with dummy GridParams, and prints the resulting metrics dictionary. Fix any errors until the backtest runs successfully.

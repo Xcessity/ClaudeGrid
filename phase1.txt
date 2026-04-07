@@ -1,0 +1,12 @@
+Phase 1 of our build: We are building the ClaudeGrid system defined in ARCHITECTURE.md. 
+Please read ARCHITECTURE.md to understand the system. 
+
+For Phase 1, I only want you to create the following files exactly as specified in the architecture:
+1. `requirements.txt` (and install them)
+2. `config.py`
+3. `data/fetcher.py`
+4. `data/cache.py`
+5. `data/screener.py`
+
+CRITICAL: Ensure `fetcher.py` correctly implements the 1-minute ghost-bar reindexing and forward-fill logic. 
+Once you have written these files, write a quick temporary test script to run the screener, fetch 4h and 1m data for a single passing symbol, and verify that the 1m data has no missing minutes or NaN close prices. Let me know when this test passes.

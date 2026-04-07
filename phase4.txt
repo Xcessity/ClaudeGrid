@@ -1,0 +1,14 @@
+Phase 4 of our build: Refer to ARCHITECTURE.md. We are now tying the system together.
+
+Please create the following files:
+1. `database/models.py`
+2. `database/storage.py`
+3. `visualization/equity_chart.py`
+4. `view_strategy.py`
+5. `main.py`
+
+CRITICAL:
+- Ensure `main.py` correctly handles the infinite loop and the holdout quarantine logic.
+- Ensure `equity_chart.py` uses the visualization data slice (the last 60 days) to generate the Plotly charts.
+
+Once written, review the entire codebase for any missing imports or structural mismatches. If everything looks good, execute `main.py` to begin the first true search cycle.

@@ -1,0 +1,13 @@
+Phase 3 of our build: Refer to ARCHITECTURE.md. We are now building the optimization pipeline.
+
+Please create the following files:
+1. `optimization/parameter_space.py`
+2. `optimization/optimizer.py`
+3. `optimization/wfo.py`
+4. `optimization/monte_carlo.py`
+
+CRITICAL: 
+- In `optimizer.py`, you MUST implement the `NumpyOHLCV` dataclass and the `prepare_4h_arrays()` pre-computation logic exactly as described to prevent joblib/loky OOM errors.
+- Ensure the `NSGAIISampler` is configured for the three objectives (Sharpe, Sortino, MaxDD).
+
+Once written, create a temporary test script to run a miniature Optuna study (e.g., 5 trials only) to verify that the Loky parallel workers successfully read the memory-mapped NumPy arrays without crashing.
