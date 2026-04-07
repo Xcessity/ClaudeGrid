@@ -48,6 +48,7 @@ class StrategyDB:
         result: WFOResult,
         dsr: float = 0.0,
         mc_p_value: float = 1.0,
+        mc_n_shuffles: int = 0,
         search_cycle: int = 0,
     ) -> int | None:
         """
@@ -142,7 +143,7 @@ class StrategyDB:
 
                 # Monte Carlo
                 mc_p_value=mc_p_value,
-                mc_n_shuffles=config.mc_n_shuffles,
+                mc_n_shuffles=mc_n_shuffles,
 
                 # Deflated Sharpe
                 deflated_sharpe=dsr,

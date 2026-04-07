@@ -163,23 +163,6 @@ def main() -> None:
                 logger.debug(f"[{symbol}] Duplicate params — skipping")
                 continue
 
-            # ── Monte Carlo significance test ────────────────────────────────
-            try:
-                p_value = monte_carlo_significance(
-                    params, opt_data, ref_atr,
-                    n_shuffles=config.mc_n_shuffles,
-                )
-            except Exception as exc:
-                logger.warning(f"[{symbol}] Monte Carlo failed: {exc}")
-                continue
-
-            if p_value > config.mc_significance:
-                logger.debug(
-                    f"[{symbol}] MC rejected: p={p_value:.3f} "
-                    f"(threshold={config.mc_significance})"
-                )
-                continue
-
             # ── WFO: rolling + anchored + holdout ────────────────────────────
             try:
                 result = wfo.validate(params, plateau_width_score=avg_pw)
@@ -202,6 +185,23 @@ def main() -> None:
                         f"[{symbol}] Quarantined for {config.holdout_quarantine_days}d "
                         f"after {holdout_failures[symbol]} holdout failures"
                     )
+                continue
+
+            # ── Monte Carlo significance test (only for WFO-passing candidates) ──
+            try:
+                p_value = monte_carlo_significance(
+                    params, opt_data, ref_atr,
+                    n_shuffles=config.mc_n_shuffles,
+                )
+            except Exception as exc:
+                logger.warning(f"[{symbol}] Monte Carlo failed: {exc}")
+                continue
+
+            if p_value > config.mc_significance:
+                logger.debug(
+                    f"[{symbol}] MC rejected: p={p_value:.3f} "
+                    f"(threshold={config.mc_significance})"
+                )
                 continue
 
             # ── Deflated Sharpe Ratio ────────────────────────────────────────
@@ -233,6 +233,7 @@ def main() -> None:
                     result,
                     dsr=dsr,
                     mc_p_value=p_value,
+                    mc_n_shuffles=config.mc_n_shuffles,
                     search_cycle=search_cycle,
                 )
             except Exception as exc:

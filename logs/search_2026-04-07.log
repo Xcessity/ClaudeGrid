@@ -613,3 +613,6 @@
 2026-04-07 19:39:12.835 | INFO     | data.cache:_get_or_fetch_funding:174 - Fetching funding rates for LINK/USDT:USDT
 2026-04-07 19:39:14.847 | INFO     | data.cache:get_or_fetch:63 - Fetching full 4h history for DOT/USDT:USDT
 2026-04-07 19:39:21.223 | INFO     | data.cache:get_or_fetch:63 - Fetching full 1m history for DOT/USDT:USDT
+2026-04-07 19:55:53.410 | INFO     | data.cache:_get_or_fetch_funding:174 - Fetching funding rates for DOT/USDT:USDT
+2026-04-07 19:55:55.411 | INFO     | data.cache:get_or_fetch:63 - Fetching full 4h history for BCH/USDT:USDT
+2026-04-07 19:56:01.824 | INFO     | data.cache:get_or_fetch:63 - Fetching full 1m history for BCH/USDT:USDT

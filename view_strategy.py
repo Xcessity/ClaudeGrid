@@ -67,9 +67,11 @@ def main() -> None:
         try:
             _, _, viz_data = cache.get_split(symbol)
 
-            # ref_atr from the optimization period (stored indirectly; recompute quickly)
+            # ref_atr must use period=14, matching how main.py computes it.
+            # Using strat.atr_period would break position sizing / dynamic slippage
+            # because the stored strategy was sized against the period-14 ref_atr.
             opt_data, _, _ = cache.get_split(symbol)
-            atr_series = compute_atr(opt_data.df_4h, period=strat.atr_period).dropna()
+            atr_series = compute_atr(opt_data.df_4h, period=14).dropna()
             ref_atr = float(np.median(atr_series)) if len(atr_series) > 0 else 1.0
             ref_atr = max(ref_atr, 1e-8)
 
