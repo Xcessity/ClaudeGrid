@@ -4,17 +4,23 @@ optimization/optimizer.py
 Multi-objective Optuna optimizer using NSGAIISampler.
 Three objectives: maximize Sharpe, maximize Sortino, minimize MaxDD.
 
-Parallel evaluation — why n_jobs=1:
-─────────────────────────────────────
-Optuna ≥ 3.x uses joblib with prefer="threads" for n_jobs > 1.
-Python threads share the GIL; the backtest inner loop is pure Python
-and holds the GIL the entire time, so multiple threads provide zero
-CPU speedup and add context-switch overhead that makes every trial slower.
-n_jobs=1 lets each trial run at full CPU speed sequentially.
+Parallelism — n_jobs=1 with module-global arrays:
+──────────────────────────────────────────────────
+Optuna study.optimize(n_jobs>1) uses joblib threads, not processes.
+The backtest inner-loop is pure Python and holds the GIL continuously —
+threading adds context-switch overhead with zero CPU speedup.
 
-Pre-computed indicator lookup tables (NumpyOHLCV.atr_arrays etc.) eliminate
-the O(500 trials × n_4h_bars) redundant pandas-ta calls. Trials index
-directly: _NP_4H.atr_arrays[period][bar_i].
+The correct approach for true parallelism would be multiprocessing with
+shared memory (multiprocessing.shared_memory), but Windows spawn overhead
+and ~130 MB of per-process memory pressure makes this counterproductive
+on the machines this runs on today.
+
+n_jobs=1 is the fastest option: each trial runs at full Python speed with
+no GIL contention, no IPC overhead, and no memory duplication.
+
+Pre-computed indicator lookup tables in the module-global _NP_4H eliminate
+the O(500 trials x n_4h_bars) redundant pandas-ta calls that would otherwise
+happen on every trial.  Trials index directly: _NP_4H.atr_arrays[period][bar_i].
 """
 from __future__ import annotations
 
@@ -44,10 +50,11 @@ from optimization.parameter_space import sample_optuna_params, PARAM_SPACE
 # Silence Optuna's per-trial INFO logs — only warnings and errors surface.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Module-level globals — set once in MultiObjectiveOptimizer.__init__, then
-# read-only for all Optuna trial threads (no per-trial file I/O or copying).
-_NP_4H: Optional[NumpyOHLCV] = None
-_NP_1M: Optional[NumpyOHLCV] = None
+# Module-level globals — set once in MultiObjectiveOptimizer.__init__ before
+# study.optimize() is called.  All Optuna trials in the same process read
+# these directly — no per-trial copying, no IPC, no GIL contention.
+_NP_4H: Optional[NumpyOHLCV] = None   # type: ignore[assignment]
+_NP_1M: Optional[NumpyOHLCV] = None   # type: ignore[assignment]
 
 
 # ── NumpyOHLCV ─────────────────────────────────────────────────────────────────
@@ -90,14 +97,24 @@ def prepare_numpy_arrays(df: pd.DataFrame) -> NumpyOHLCV:
     """
     Convert a standard OHLCV DataFrame to a NumpyOHLCV without indicator tables.
     Used for df_1m (fill bars) — indicators are not needed there.
+
+    Timestamps are always stored as nanoseconds (int64) regardless of the
+    DatetimeIndex's internal resolution.  Parquet files written by pandas 2.x
+    often use datetime64[ms, UTC] internally; view(np.int64) on such an index
+    returns milliseconds, not nanoseconds.  Without the explicit as_unit('ns')
+    conversion, _numpy_to_dataframe would misinterpret ms timestamps as ns,
+    placing consecutive 1m bars only 60,000 ns = 0.00006 s apart — causing
+    each 4h window to appear to contain ~240,000,000 1m bars and making every
+    backtest trial take hours instead of seconds.
     """
+    timestamps_ns = np.asarray(df.index.as_unit("ns").asi8, dtype=np.int64)
     return NumpyOHLCV(
         open=np.ascontiguousarray(df["open"].values,   dtype=np.float64),
         high=np.ascontiguousarray(df["high"].values,   dtype=np.float64),
         low =np.ascontiguousarray(df["low"].values,    dtype=np.float64),
         close=np.ascontiguousarray(df["close"].values, dtype=np.float64),
         volume=np.ascontiguousarray(df["volume"].values, dtype=np.float64),
-        timestamps=np.asarray(df.index.view(np.int64), dtype=np.int64),
+        timestamps=timestamps_ns,
     )
 
 
@@ -211,22 +228,6 @@ def _run_trial(
         }
 
 
-# ── Top-level (picklable) Optuna objective ─────────────────────────────────────
-
-def _top_level_objective(
-    trial: optuna.Trial,
-    funding_array: pd.Series,
-    ref_atr: float,
-) -> tuple:
-    """
-    Optuna trial objective. _NP_4H / _NP_1M are module globals set once before
-    study.optimize() — no per-trial file I/O or array copying.
-    """
-    params = sample_optuna_params(trial)
-    m = _run_trial(params, _NP_4H, _NP_1M, funding_array, ref_atr)
-    if m["n_trades"] < config.min_trades_per_backtest or m.get("killed_early", False):
-        return (-1.0, -1.0, 1.0)
-    return (m["sharpe"], m["sortino"], m["max_drawdown"])
 
 
 # ── MultiObjectiveOptimizer ────────────────────────────────────────────────────
@@ -249,16 +250,17 @@ class MultiObjectiveOptimizer:
         n_workers: int = -1,
         eval_fn=None,           # unused — kept for API compatibility
     ):
-        logger.info("MultiObjectiveOptimizer: converting DataFrames → NumPy arrays …")
+        logger.info("MultiObjectiveOptimizer: converting DataFrames -> NumPy arrays ...")
 
-        # Pre-compute ONCE and store in module globals so all trial threads
-        # share the same arrays with no per-trial copying or file I/O.
+        # Pre-compute all indicator arrays ONCE and store in module globals.
+        # study.optimize(n_jobs=1) runs every trial in this same process, so
+        # the objective function can read _NP_4H / _NP_1M without any copying.
         global _NP_4H, _NP_1M
         _NP_4H = prepare_4h_arrays(opt_data.df_4h)
         _NP_1M = prepare_numpy_arrays(opt_data.df_1m)
 
         # Funding is tiny (~5 K rows over 5 years) — keep as pd.Series.
-        self.funding  = (
+        self.funding = (
             opt_data.funding
             if opt_data.funding is not None
             else pd.Series(dtype=float)
@@ -273,22 +275,25 @@ class MultiObjectiveOptimizer:
             self.ref_atr = 1.0
         self.ref_atr = max(self.ref_atr, 1e-8)
 
-        self.n_trials  = n_trials
+        self.n_trials = n_trials
+        # n_workers stored for info logging only — study runs with n_jobs=1.
         self.n_workers = n_workers
 
     # ── Optuna study ──────────────────────────────────────────────────────────
 
     def run(self) -> optuna.Study:
         """
-        Run the multi-objective NSGAIISampler study.
+        Run the multi-objective NSGAIISampler study, n_jobs=1.
 
-        NSGAIISampler implements NSGA-II natively inside Optuna:
-          - population_size=50: each generation evaluates 50 trials
-          - mutation_prob=None: auto (1/n_params)
-          - crossover_prob=0.9: standard NSGA-II default
-          - seed=42: reproducible Pareto front across runs
+        NSGAIISampler:
+          population_size=50: first 50 trials are random (initial generation).
+          Subsequent generations use NSGA-II crossover/mutation guided by the
+          Pareto front of completed trials.
 
-        directions: sharpe↑  sortino↑  max_dd↓
+        n_jobs=1: Optuna 3.x uses joblib threads for n_jobs>1.  Threads share
+        the GIL; the backtest inner-loop holds it continuously, so threading
+        adds pure overhead.  n_jobs=1 gives full-speed sequential execution.
+        Each trial reads _NP_4H / _NP_1M from module globals — zero copying.
         """
         sampler = optuna.samplers.NSGAIISampler(
             population_size=50,
@@ -296,31 +301,24 @@ class MultiObjectiveOptimizer:
             crossover_prob=0.9,
             seed=42,
         )
-        # Clean up any stale DB left by a previous interrupted run.
-        # Stale RUNNING trials hold SQLite write locks; loky workers pile up
-        # waiting for a lock that never releases → 0% deadlock.
-        _db_path = "optuna_journal.db"
-        if os.path.exists(_db_path):
-            os.remove(_db_path)
-            logger.info(f"Removed stale {_db_path}")
-
-        # In-memory storage: no locking, no stale-state risk.
-        # NSGAIISampler does not require cross-process shared storage.
         study = optuna.create_study(
             directions=["maximize", "maximize", "minimize"],
             sampler=sampler,
         )
 
-        # Lambda captures only self.funding (tiny pd.Series) and self.ref_atr (float).
-        # _NP_4H / _NP_1M are module globals — no serialization needed.
-        obj = lambda trial: _top_level_objective(trial, self.funding, self.ref_atr)
+        funding = self.funding
+        ref_atr = self.ref_atr
 
-        # n_jobs=1: Optuna 3.x uses threads for n_jobs>1, but the backtest inner
-        # loop is pure Python and holds the GIL the entire time — threading adds
-        # context-switch overhead with zero CPU speedup. Sequential is faster.
+        def objective(trial: optuna.Trial) -> tuple:
+            params = sample_optuna_params(trial)
+            m = _run_trial(params, _NP_4H, _NP_1M, funding, ref_atr)
+            if m["n_trades"] < config.min_trades_per_backtest or m.get("killed_early", False):
+                return (-1.0, -1.0, 1.0)
+            return (m["sharpe"], m["sortino"], m["max_drawdown"])
+
         logger.info(f"Starting NSGAIISampler study: {self.n_trials} trials, n_jobs=1")
         study.optimize(
-            obj,
+            objective,
             n_trials=self.n_trials,
             n_jobs=1,
             show_progress_bar=True,
