@@ -301,7 +301,7 @@ class MultiObjectiveOptimizer:
                 objective,
                 n_trials=self.n_trials,
                 n_jobs=self.n_workers,
-                show_progress_bar=False,
+                show_progress_bar=True,
             )
         logger.info("Optuna study complete.")
         return study

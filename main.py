@@ -15,7 +15,10 @@ Holdout quarantine:
 """
 from __future__ import annotations
 
+import itertools
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -50,6 +53,36 @@ logger.add(
     level="DEBUG",
     enqueue=True,
 )
+
+
+class _Spinner:
+    """Context manager: shows a moving spinner + elapsed time on stderr."""
+    _CHARS = r"|/-\\"
+
+    def __init__(self, label: str):
+        self._label = label
+        self._stop  = threading.Event()
+        self._t     = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        t0 = time.monotonic()
+        for ch in itertools.cycle(self._CHARS):
+            if self._stop.is_set():
+                break
+            elapsed = int(time.monotonic() - t0)
+            sys.stderr.write(f"\r  {ch}  {self._label}  [{elapsed}s]   ")
+            sys.stderr.flush()
+            time.sleep(0.12)
+        sys.stderr.write("\r" + " " * 80 + "\r")
+        sys.stderr.flush()
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._t.join()
 
 
 def main() -> None:
@@ -137,7 +170,7 @@ def main() -> None:
                 n_trials=config.n_optuna_trials,
                 n_workers=config.n_workers,
             )
-            study  = optimizer.run()
+            study  = optimizer.run()   # tqdm progress bar shown by Optuna
             stable = optimizer.get_stable_params(study)   # top-5 Pareto + plateau
             pw_scores = optimizer.score_plateau_width(study)
             avg_pw = float(np.mean(list(pw_scores.values()))) if pw_scores else 0.0
@@ -167,7 +200,8 @@ def main() -> None:
 
             # ── WFO: rolling + anchored + holdout ────────────────────────────
             try:
-                result = wfo.validate(params, plateau_width_score=avg_pw)
+                with _Spinner(f"[{symbol}] WFO validate"):
+                    result = wfo.validate(params, plateau_width_score=avg_pw)
             except Exception as exc:
                 logger.error(f"[{symbol}] WFO failed: {exc}")
                 continue
@@ -191,10 +225,11 @@ def main() -> None:
 
             # ── Monte Carlo significance test (only for WFO-passing candidates) ──
             try:
-                p_value = monte_carlo_significance(
-                    params, opt_data, ref_atr,
-                    n_shuffles=config.mc_n_shuffles,
-                )
+                with _Spinner(f"[{symbol}] Monte Carlo ({config.mc_n_shuffles} shuffles)"):
+                    p_value = monte_carlo_significance(
+                        params, opt_data, ref_atr,
+                        n_shuffles=config.mc_n_shuffles,
+                    )
             except Exception as exc:
                 logger.warning(f"[{symbol}] Monte Carlo failed: {exc}")
                 continue

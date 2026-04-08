@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import ccxt
 import pandas as pd
 from loguru import logger
+from tqdm import tqdm
 
 from config import config
 
@@ -54,33 +55,51 @@ class BinanceFetcher:
         # Without this, ccxt returns only the most-recent LIMIT bars and the
         # next page starts after them (in the future), so the loop ends with
         # just one page of data instead of the full history.
-        if since is None:
+        full_history = since is None
+        if full_history:
             earliest = self.get_earliest_timestamp(symbol, timeframe)
             since_ms = int(earliest.timestamp() * 1000)
         else:
+            earliest = None
             since_ms = int(since.timestamp() * 1000)
+
+        # Estimate total bars for the progress bar (full-history fetches only)
+        if full_history:
+            end_dt      = until or datetime.now(timezone.utc)
+            tf_seconds  = 60 if timeframe == "1m" else 14400   # 1m or 4h
+            est_total   = max(1, int((end_dt.timestamp() - earliest.timestamp()) / tf_seconds))
+        else:
+            est_total = None
 
         all_candles: list[list] = []
 
-        while True:
-            candles = self._fetch_with_retry(symbol, timeframe, since_ms)
-            if not candles:
-                break
+        with tqdm(
+            total=est_total,
+            unit="bars",
+            desc=f"    {symbol} {timeframe}",
+            leave=False,
+            disable=est_total is None or est_total < 5_000,
+        ) as pbar:
+            while True:
+                candles = self._fetch_with_retry(symbol, timeframe, since_ms)
+                if not candles:
+                    break
 
-            # Filter out candles beyond `until`
-            if until_ms:
-                candles = [c for c in candles if c[0] <= until_ms]
+                # Filter out candles beyond `until`
+                if until_ms:
+                    candles = [c for c in candles if c[0] <= until_ms]
 
-            all_candles.extend(candles)
+                all_candles.extend(candles)
+                pbar.update(len(candles))
 
-            if len(candles) < self.LIMIT:
-                break  # last page
+                if len(candles) < self.LIMIT:
+                    break  # last page
 
-            last_ts = candles[-1][0]
-            if until_ms and last_ts >= until_ms:
-                break
+                last_ts = candles[-1][0]
+                if until_ms and last_ts >= until_ms:
+                    break
 
-            since_ms = last_ts + 1  # next page starts after last candle
+                since_ms = last_ts + 1  # next page starts after last candle
 
         if not all_candles:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
