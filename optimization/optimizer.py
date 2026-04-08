@@ -19,10 +19,13 @@ happen inside workers. Workers index directly: np_4h.atr_arrays[period][bar_i].
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
+import joblib
 import numpy as np
 import optuna
 import pandas as pd
@@ -44,6 +47,11 @@ from optimization.parameter_space import sample_optuna_params, PARAM_SPACE
 
 # Silence Optuna's per-trial INFO logs — only warnings and errors surface.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ── Shared mmap paths (written in __init__, read by worker processes) ──────────
+TEMP_DIR     = tempfile.gettempdir()
+MMAP_4H_PATH = os.path.join(TEMP_DIR, "claudegrid_np_4h.mmap")
+MMAP_1M_PATH = os.path.join(TEMP_DIR, "claudegrid_np_1m.mmap")
 
 
 # ── NumpyOHLCV ─────────────────────────────────────────────────────────────────
@@ -207,6 +215,27 @@ def _run_trial(
         }
 
 
+# ── Top-level (picklable) Optuna objective ─────────────────────────────────────
+
+def _top_level_objective(
+    trial: optuna.Trial,
+    funding_array: pd.Series,
+    ref_atr: float,
+) -> tuple:
+    """
+    Standalone (non-closure) objective so loky never serializes large arrays.
+    Each worker loads np_4h / np_1m directly from the mmap files written in
+    MultiObjectiveOptimizer.__init__ — true zero-copy, no per-worker pickle.
+    """
+    np_4h = joblib.load(MMAP_4H_PATH, mmap_mode="r")
+    np_1m = joblib.load(MMAP_1M_PATH, mmap_mode="r")
+    params = sample_optuna_params(trial)
+    m = _run_trial(params, np_4h, np_1m, funding_array, ref_atr)
+    if m["n_trades"] < config.min_trades_per_backtest or m.get("killed_early", False):
+        return (-1.0, -1.0, 1.0)
+    return (m["sharpe"], m["sortino"], m["max_drawdown"])
+
+
 # ── MultiObjectiveOptimizer ────────────────────────────────────────────────────
 
 class MultiObjectiveOptimizer:
@@ -229,10 +258,15 @@ class MultiObjectiveOptimizer:
     ):
         logger.info("MultiObjectiveOptimizer: converting DataFrames → NumPy arrays …")
 
-        # Pre-convert ONCE before any trial starts.
-        # Workers receive shared mmap arrays — no 200 MB serialization per trial.
-        self.np_4h    = prepare_4h_arrays(opt_data.df_4h)
-        self.np_1m    = prepare_numpy_arrays(opt_data.df_1m)
+        # Pre-convert ONCE and write to disk as mmap files.
+        # Workers load with mmap_mode='r' — true zero-copy, no per-worker pickle.
+        # np_4h / np_1m are NOT stored on self to prevent the Loky pickler from
+        # choking on the large indicator tables (~hundreds of MB in RAM).
+        np_4h = prepare_4h_arrays(opt_data.df_4h)
+        np_1m = prepare_numpy_arrays(opt_data.df_1m)
+        joblib.dump(np_4h, MMAP_4H_PATH)
+        joblib.dump(np_1m, MMAP_1M_PATH)
+        logger.info(f"Dumped mmap arrays → {MMAP_4H_PATH}, {MMAP_1M_PATH}")
 
         # Funding is tiny (~5 K rows over 5 years) — keep as pd.Series, fine to pickle.
         self.funding  = (
@@ -242,7 +276,7 @@ class MultiObjectiveOptimizer:
         )
 
         # Stable ref_atr from the full optimization period (period=14 default).
-        atr14 = self.np_4h.atr_arrays.get(14)
+        atr14 = np_4h.atr_arrays.get(14)
         if atr14 is not None:
             valid = atr14[~np.isnan(atr14)]
             self.ref_atr = float(np.median(valid)) if len(valid) > 0 else 1.0
@@ -273,24 +307,20 @@ class MultiObjectiveOptimizer:
             crossover_prob=0.9,
             seed=42,
         )
+        # SQLite storage is required for NSGAIISampler with n_jobs > 1:
+        # each worker process must read all existing trials to compute the
+        # Pareto front; the default in-memory storage is not cross-process.
         study = optuna.create_study(
             directions=["maximize", "maximize", "minimize"],
             sampler=sampler,
+            storage="sqlite:///optuna_journal.db",
+            load_if_exists=True,
         )
 
-        # Capture arrays in closure — loky will mmap them to workers.
-        np_4h    = self.np_4h
-        np_1m    = self.np_1m
-        funding  = self.funding
-        ref_atr  = self.ref_atr
-        min_trades = config.min_trades_per_backtest
-
-        def objective(trial: optuna.Trial):
-            params = sample_optuna_params(trial)
-            m = _run_trial(params, np_4h, np_1m, funding, ref_atr)
-            if m["n_trades"] < min_trades or m.get("killed_early", False):
-                return (-1.0, -1.0, 1.0)
-            return (m["sharpe"], m["sortino"], m["max_drawdown"])
+        # Lambda only captures self.funding (pd.Series, tiny) and self.ref_atr
+        # (float).  The heavy np_4h / np_1m are loaded from mmap inside each
+        # worker via _top_level_objective — no large-array serialization.
+        obj = lambda trial: _top_level_objective(trial, self.funding, self.ref_atr)
 
         logger.info(
             f"Starting NSGAIISampler study: {self.n_trials} trials, "
@@ -298,7 +328,7 @@ class MultiObjectiveOptimizer:
         )
         with parallel_backend("loky"):
             study.optimize(
-                objective,
+                obj,
                 n_trials=self.n_trials,
                 n_jobs=self.n_workers,
                 show_progress_bar=True,

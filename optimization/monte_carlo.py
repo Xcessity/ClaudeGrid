@@ -24,6 +24,10 @@ Integration in main.py:
 """
 from __future__ import annotations
 
+import os
+import tempfile
+
+import joblib
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -34,6 +38,11 @@ from data.cache import DataPair
 from backtester.engine import Backtester
 from backtester.metrics import compute_metrics
 from strategy.grid_engine import GridParams
+
+# ── Shared mmap paths for MC DataFrames ────────────────────────────────────────
+_TEMP_DIR        = tempfile.gettempdir()
+MMAP_MC_4H_PATH  = os.path.join(_TEMP_DIR, "claudegrid_mc_4h.mmap")
+MMAP_MC_1M_PATH  = os.path.join(_TEMP_DIR, "claudegrid_mc_1m.mmap")
 
 
 # ── Composite score ────────────────────────────────────────────────────────────
@@ -83,19 +92,25 @@ def _rebuild_ohlcv_from_close(
 # ── Single shuffle worker ──────────────────────────────────────────────────────
 
 def _run_one_shuffle(
-    params:     GridParams,
-    df_4h:      pd.DataFrame,
-    df_1m:      pd.DataFrame,
-    funding:    pd.Series,
-    log_returns: np.ndarray,
+    params:        GridParams,
+    log_returns:   np.ndarray,
     initial_close: float,
-    ref_atr:    float,
-    seed:       int,
+    funding:       pd.Series,
+    ref_atr:       float,
+    seed:          int,
 ) -> float:
     """
     Build one synthetic price series, run a backtest, return composite_score.
     Each call is independent and safe to run in a loky worker.
+
+    DataFrames are NOT received as arguments — they are loaded from mmap files
+    written by monte_carlo_significance before the parallel loop starts.
+    This eliminates the per-worker pickle overhead for large DataFrames.
     """
+    # Load DataFrames via mmap — read-only, zero-copy from disk.
+    df_4h = joblib.load(MMAP_MC_4H_PATH, mmap_mode="r")
+    df_1m = joblib.load(MMAP_MC_1M_PATH, mmap_mode="r")
+
     rng = np.random.default_rng(seed)
     shuffled_returns = rng.permutation(log_returns)
     shuffled_prices  = initial_close * np.exp(
@@ -149,21 +164,25 @@ def monte_carlo_significance(
         f"score={real_score:.4f} — running {n_shuffles} shuffles …"
     )
 
-    # ── Prepare shared data (passed by reference to workers) ─────────────────
-    df_1m       = data.df_1m
-    close_vals  = df_1m["close"].values
-    log_returns = np.diff(np.log(np.where(close_vals > 1e-10, close_vals, 1e-10)))
+    # ── Prepare shared data ───────────────────────────────────────────────────
+    df_1m         = data.df_1m
+    close_vals    = df_1m["close"].values
+    log_returns   = np.diff(np.log(np.where(close_vals > 1e-10, close_vals, 1e-10)))
     initial_close = float(close_vals[0])
 
-    df_4h    = data.df_4h
-    funding  = data.funding if data.funding is not None else pd.Series(dtype=float)
+    funding   = data.funding if data.funding is not None else pd.Series(dtype=float)
     n_workers = config.n_workers
 
-    # ── Parallel shuffles ─────────────────────────────────────────────────────
+    # Dump DataFrames to mmap files once; workers load with mmap_mode='r'.
+    # Only log_returns (tiny 1-D array) + small scalars are pickled per task.
+    joblib.dump(data.df_4h, MMAP_MC_4H_PATH)
+    joblib.dump(df_1m,      MMAP_MC_1M_PATH)
+    logger.debug(f"MC: dumped mmap frames → {MMAP_MC_4H_PATH}, {MMAP_MC_1M_PATH}")
+
+    # ── Parallel shuffles — shuffling happens entirely inside each worker ─────
     scores: list[float] = Parallel(n_jobs=n_workers, backend="loky")(
         delayed(_run_one_shuffle)(
-            params, df_4h, df_1m, funding,
-            log_returns, initial_close, ref_atr,
+            params, log_returns, initial_close, funding, ref_atr,
             seed=i,
         )
         for i in range(n_shuffles)
