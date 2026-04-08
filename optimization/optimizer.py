@@ -29,7 +29,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed
 from loguru import logger
 
 from config import config
@@ -52,6 +52,9 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 TEMP_DIR     = tempfile.gettempdir()
 MMAP_4H_PATH = os.path.join(TEMP_DIR, "claudegrid_np_4h.mmap")
 MMAP_1M_PATH = os.path.join(TEMP_DIR, "claudegrid_np_1m.mmap")
+
+# Per-worker cache: load from disk once per worker thread/process, not per trial.
+_WORKER_CACHE: dict = {}
 
 
 # ── NumpyOHLCV ─────────────────────────────────────────────────────────────────
@@ -227,8 +230,11 @@ def _top_level_objective(
     Each worker loads np_4h / np_1m directly from the mmap files written in
     MultiObjectiveOptimizer.__init__ — true zero-copy, no per-worker pickle.
     """
-    np_4h = joblib.load(MMAP_4H_PATH, mmap_mode="r")
-    np_1m = joblib.load(MMAP_1M_PATH, mmap_mode="r")
+    if "np_4h" not in _WORKER_CACHE:
+        _WORKER_CACHE["np_4h"] = joblib.load(MMAP_4H_PATH, mmap_mode="r")
+        _WORKER_CACHE["np_1m"] = joblib.load(MMAP_1M_PATH, mmap_mode="r")
+    np_4h = _WORKER_CACHE["np_4h"]
+    np_1m = _WORKER_CACHE["np_1m"]
     params = sample_optuna_params(trial)
     m = _run_trial(params, np_4h, np_1m, funding_array, ref_atr)
     if m["n_trades"] < config.min_trades_per_backtest or m.get("killed_early", False):
@@ -307,14 +313,19 @@ class MultiObjectiveOptimizer:
             crossover_prob=0.9,
             seed=42,
         )
-        # SQLite storage is required for NSGAIISampler with n_jobs > 1:
-        # each worker process must read all existing trials to compute the
-        # Pareto front; the default in-memory storage is not cross-process.
+        # Clean up any stale DB left by a previous interrupted run.
+        # Stale RUNNING trials hold SQLite write locks; loky workers pile up
+        # waiting for a lock that never releases → 0% deadlock.
+        _db_path = "optuna_journal.db"
+        if os.path.exists(_db_path):
+            os.remove(_db_path)
+            logger.info(f"Removed stale {_db_path}")
+
+        # In-memory storage: no locking, no stale-state risk.
+        # NSGAIISampler does not require cross-process shared storage.
         study = optuna.create_study(
             directions=["maximize", "maximize", "minimize"],
             sampler=sampler,
-            storage="sqlite:///optuna_journal.db",
-            load_if_exists=True,
         )
 
         # Lambda only captures self.funding (pd.Series, tiny) and self.ref_atr
@@ -326,13 +337,12 @@ class MultiObjectiveOptimizer:
             f"Starting NSGAIISampler study: {self.n_trials} trials, "
             f"n_jobs={self.n_workers}"
         )
-        with parallel_backend("loky"):
-            study.optimize(
-                obj,
-                n_trials=self.n_trials,
-                n_jobs=self.n_workers,
-                show_progress_bar=True,
-            )
+        study.optimize(
+            obj,
+            n_trials=self.n_trials,
+            n_jobs=self.n_workers,
+            show_progress_bar=True,
+        )
         logger.info("Optuna study complete.")
         return study
 
