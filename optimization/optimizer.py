@@ -4,32 +4,28 @@ optimization/optimizer.py
 Multi-objective Optuna optimizer using NSGAIISampler.
 Three objectives: maximize Sharpe, maximize Sortino, minimize MaxDD.
 
-Memory-safe parallel evaluation (loky workers):
-──────────────────────────────────────────────
-Problem: passing df_1m (~200 MB DataFrame) to each loky worker via pickle
-causes 200 MB × n_workers memory bloat and potential OOM crashes.
-
-Fix: convert all DataFrames to contiguous NumPy arrays ONCE in __init__,
-before any trial starts. Joblib/loky automatically memory-maps large NumPy
-arrays when transferring to worker processes — no per-worker copy.
+Parallel evaluation — why n_jobs=1:
+─────────────────────────────────────
+Optuna ≥ 3.x uses joblib with prefer="threads" for n_jobs > 1.
+Python threads share the GIL; the backtest inner loop is pure Python
+and holds the GIL the entire time, so multiple threads provide zero
+CPU speedup and add context-switch overhead that makes every trial slower.
+n_jobs=1 lets each trial run at full CPU speed sequentially.
 
 Pre-computed indicator lookup tables (NumpyOHLCV.atr_arrays etc.) eliminate
-the O(500 trials × n_4h_bars) redundant pandas-ta calls that would otherwise
-happen inside workers. Workers index directly: np_4h.atr_arrays[period][bar_i].
+the O(500 trials × n_4h_bars) redundant pandas-ta calls. Trials index
+directly: _NP_4H.atr_arrays[period][bar_i].
 """
 from __future__ import annotations
 
 import os
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
-import joblib
 import numpy as np
 import optuna
 import pandas as pd
-from joblib import Parallel, delayed
 from loguru import logger
 
 from config import config
@@ -48,13 +44,10 @@ from optimization.parameter_space import sample_optuna_params, PARAM_SPACE
 # Silence Optuna's per-trial INFO logs — only warnings and errors surface.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ── Shared mmap paths (written in __init__, read by worker processes) ──────────
-TEMP_DIR     = tempfile.gettempdir()
-MMAP_4H_PATH = os.path.join(TEMP_DIR, "claudegrid_np_4h.mmap")
-MMAP_1M_PATH = os.path.join(TEMP_DIR, "claudegrid_np_1m.mmap")
-
-# Per-worker cache: load from disk once per worker thread/process, not per trial.
-_WORKER_CACHE: dict = {}
+# Module-level globals — set once in MultiObjectiveOptimizer.__init__, then
+# read-only for all Optuna trial threads (no per-trial file I/O or copying).
+_NP_4H: Optional[NumpyOHLCV] = None
+_NP_1M: Optional[NumpyOHLCV] = None
 
 
 # ── NumpyOHLCV ─────────────────────────────────────────────────────────────────
@@ -226,17 +219,11 @@ def _top_level_objective(
     ref_atr: float,
 ) -> tuple:
     """
-    Standalone (non-closure) objective so loky never serializes large arrays.
-    Each worker loads np_4h / np_1m directly from the mmap files written in
-    MultiObjectiveOptimizer.__init__ — true zero-copy, no per-worker pickle.
+    Optuna trial objective. _NP_4H / _NP_1M are module globals set once before
+    study.optimize() — no per-trial file I/O or array copying.
     """
-    if "np_4h" not in _WORKER_CACHE:
-        _WORKER_CACHE["np_4h"] = joblib.load(MMAP_4H_PATH, mmap_mode="r")
-        _WORKER_CACHE["np_1m"] = joblib.load(MMAP_1M_PATH, mmap_mode="r")
-    np_4h = _WORKER_CACHE["np_4h"]
-    np_1m = _WORKER_CACHE["np_1m"]
     params = sample_optuna_params(trial)
-    m = _run_trial(params, np_4h, np_1m, funding_array, ref_atr)
+    m = _run_trial(params, _NP_4H, _NP_1M, funding_array, ref_atr)
     if m["n_trades"] < config.min_trades_per_backtest or m.get("killed_early", False):
         return (-1.0, -1.0, 1.0)
     return (m["sharpe"], m["sortino"], m["max_drawdown"])
@@ -264,17 +251,13 @@ class MultiObjectiveOptimizer:
     ):
         logger.info("MultiObjectiveOptimizer: converting DataFrames → NumPy arrays …")
 
-        # Pre-convert ONCE and write to disk as mmap files.
-        # Workers load with mmap_mode='r' — true zero-copy, no per-worker pickle.
-        # np_4h / np_1m are NOT stored on self to prevent the Loky pickler from
-        # choking on the large indicator tables (~hundreds of MB in RAM).
-        np_4h = prepare_4h_arrays(opt_data.df_4h)
-        np_1m = prepare_numpy_arrays(opt_data.df_1m)
-        joblib.dump(np_4h, MMAP_4H_PATH)
-        joblib.dump(np_1m, MMAP_1M_PATH)
-        logger.info(f"Dumped mmap arrays → {MMAP_4H_PATH}, {MMAP_1M_PATH}")
+        # Pre-compute ONCE and store in module globals so all trial threads
+        # share the same arrays with no per-trial copying or file I/O.
+        global _NP_4H, _NP_1M
+        _NP_4H = prepare_4h_arrays(opt_data.df_4h)
+        _NP_1M = prepare_numpy_arrays(opt_data.df_1m)
 
-        # Funding is tiny (~5 K rows over 5 years) — keep as pd.Series, fine to pickle.
+        # Funding is tiny (~5 K rows over 5 years) — keep as pd.Series.
         self.funding  = (
             opt_data.funding
             if opt_data.funding is not None
@@ -282,7 +265,7 @@ class MultiObjectiveOptimizer:
         )
 
         # Stable ref_atr from the full optimization period (period=14 default).
-        atr14 = np_4h.atr_arrays.get(14)
+        atr14 = _NP_4H.atr_arrays.get(14)
         if atr14 is not None:
             valid = atr14[~np.isnan(atr14)]
             self.ref_atr = float(np.median(valid)) if len(valid) > 0 else 1.0
@@ -328,19 +311,18 @@ class MultiObjectiveOptimizer:
             sampler=sampler,
         )
 
-        # Lambda only captures self.funding (pd.Series, tiny) and self.ref_atr
-        # (float).  The heavy np_4h / np_1m are loaded from mmap inside each
-        # worker via _top_level_objective — no large-array serialization.
+        # Lambda captures only self.funding (tiny pd.Series) and self.ref_atr (float).
+        # _NP_4H / _NP_1M are module globals — no serialization needed.
         obj = lambda trial: _top_level_objective(trial, self.funding, self.ref_atr)
 
-        logger.info(
-            f"Starting NSGAIISampler study: {self.n_trials} trials, "
-            f"n_jobs={self.n_workers}"
-        )
+        # n_jobs=1: Optuna 3.x uses threads for n_jobs>1, but the backtest inner
+        # loop is pure Python and holds the GIL the entire time — threading adds
+        # context-switch overhead with zero CPU speedup. Sequential is faster.
+        logger.info(f"Starting NSGAIISampler study: {self.n_trials} trials, n_jobs=1")
         study.optimize(
             obj,
             n_trials=self.n_trials,
-            n_jobs=self.n_workers,
+            n_jobs=1,
             show_progress_bar=True,
         )
         logger.info("Optuna study complete.")
