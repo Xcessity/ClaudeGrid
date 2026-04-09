@@ -101,6 +101,7 @@ def generate_chart(
     html_path = f"{output_dir}/{sym}_{sid}.html"
     png_path  = f"{output_dir}/{sym}_{sid}.png"
 
+    os.makedirs(os.path.dirname(html_path), exist_ok=True)
     fig.write_html(html_path)
     logger.info(f"Chart saved: {html_path}")
 
